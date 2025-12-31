@@ -86,7 +86,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({ rule, setRule, fileCount }) =>
                     </div>
                 </div>
                 <p className="text-xs text-slate-500 mt-1">
-                    保留原有跳号，仅对数字进行加减运算 (1, 3 -> 3, 5)
+                    保留原有跳号，仅对数字进行加减运算 (1, 3 &rarr; 3, 5)
                 </p>
             </div>
         )}
