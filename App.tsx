@@ -178,13 +178,6 @@ const App: React.FC = () => {
             {/* Upload Area (Conditional) */}
             {files.length === 0 ? (
                 <div className="border-2 border-dashed border-slate-300 rounded-2xl bg-white p-12 text-center hover:border-primary-400 hover:bg-primary-50/30 transition-all cursor-pointer group relative">
-                    <input 
-                        type="file" 
-                        multiple 
-                        onChange={handleFileUpload} 
-                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                        accept=".pdf,.docx,.doc,.jpg,.jpeg,.png"
-                    />
                     <div className="bg-primary-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform">
                         <UploadCloud className="w-8 h-8 text-primary-600" />
                     </div>
@@ -197,6 +190,13 @@ const App: React.FC = () => {
                         <span className="flex items-center gap-1"><RefreshCw className="w-3 h-3" /> 自动排序</span>
                         <span className="flex items-center gap-1"><Download className="w-3 h-3" /> 一键打包</span>
                     </div>
+                    <input 
+                        type="file" 
+                        multiple 
+                        onChange={handleFileUpload} 
+                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                        accept=".pdf,.docx,.doc,.jpg,.jpeg,.png"
+                    />
                 </div>
             ) : (
                 <>
@@ -211,7 +211,7 @@ const App: React.FC = () => {
                                 type="file" 
                                 multiple 
                                 onChange={handleFileUpload} 
-                                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                                 accept=".pdf,.docx,.doc,.jpg,.jpeg,.png"
                             />
                         </div>
