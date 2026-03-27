@@ -1,0 +1,2204 @@
+﻿=== types.ts ===
+export interface ResearchFile {
+  id: string;
+  originalFile: File;
+  originalName: string; // The full original filename
+  filenameCleanName: string; // Clean name derived from the original filename
+  cleanName: string; // Filename stripped of old numbers
+  extension: string; // .pdf, .docx
+  duplicatedName: boolean; // True when cleanName + extension collides with another file
+  publicationDate: string; // ISO Date string YYYY-MM-DD
+  manualOverride: boolean; // If true, user manually set the date
+  originalNumber: number | null; // Extracted existing number, null if none found
+  nameSource: NamingSource; // Active naming source for the current cleanName
+  pdfMetadata: PDFMetadataResult | null; // Parsed PDF metadata when available
+  pdfMetadataStatus: PDFMetadataStatus | null; // Current PDF metadata parsing status
+}
+
+export interface PDFMetadataResult {
+  bodyTitle: string | null;
+  metadataTitle: string | null;
+  title: string | null;
+  author: string | null;
+  year: string | null;
+  cleanName: string | null;
+  titleSource: PDFFieldSource | null;
+  authorSource: PDFFieldSource | null;
+  yearSource: PDFFieldSource | null;
+  cleanNameSource: NamingSource | null;
+}
+
+export type PDFMetadataStatus = 'pending' | 'parsed' | 'unavailable';
+export type PDFFieldSource = 'body' | 'metadata';
+export type NamingSource = 'filename' | 'body' | 'metadata';
+
+export type RenamingMode = 'sequential' | 'offset';
+
+export interface RenamingRule {
+  mode: RenamingMode;
+  startNumber: number; // For sequential mode
+  offsetValue: number; // For offset mode (+2, -1 etc)
+  formatType: NumberFormat;
+  customPrefix: string;
+  customSuffix: string; // Separator between number and title
+  minDigits: number; // Padding, e.g., 2 for '01'
+}
+
+export enum NumberFormat {
+  Brackets = '[N]',    // [01]
+  Dot = 'N.',          // 1.
+  Underscore = 'N_',   // 01_
+  Hyphen = 'N-',       // 1-
+  Custom = 'CUSTOM',   // Uses prefix
+}
+
+export type SortOrder = 'newest' | 'oldest' | 'name' | 'number' | 'manual';
+
+=== utils/fileUtils.ts ===
+import {
+  NamingSource,
+  NumberFormat,
+  PDFFieldSource,
+  PDFMetadataResult,
+  RenamingRule,
+  ResearchFile,
+} from '../types';
+
+type PdfJsModule = typeof import('pdfjs-dist');
+
+type PdfJsContext = {
+  pdfjs: PdfJsModule;
+  workerUrl: string;
+};
+
+type PdfDateStringLike = {
+  toDateObject: (input: string) => Date | null;
+};
+
+type PdfMetadataHandle = {
+  get: (name: string) => unknown;
+} | null;
+
+type PdfTextItem = {
+  str: string;
+  transform: number[];
+  width: number;
+  height: number;
+};
+
+type PdfTextLine = {
+  text: string;
+  x: number;
+  y: number;
+  fontSize: number;
+  pageNumber: number;
+};
+
+type PdfDocumentLike = {
+  numPages: number;
+  getMetadata: () => Promise<{
+    info: Record<string, unknown>;
+    metadata: PdfMetadataHandle;
+  }>;
+  getPage: (pageNumber: number) => Promise<{
+    getTextContent: (params?: {
+      disableNormalization?: boolean;
+      includeMarkedContent?: boolean;
+    }) => Promise<{ items: unknown[] }>;
+    cleanup: (resetStats?: boolean) => boolean;
+  }>;
+  destroy: () => Promise<void>;
+};
+
+type PdfBodyFields = {
+  title: string | null;
+  author: string | null;
+  year: string | null;
+};
+
+type PdfMetadataFields = {
+  title: string | null;
+  author: string | null;
+  year: string | null;
+};
+
+type ResolvedPdfField = {
+  value: string | null;
+  source: PDFFieldSource | null;
+};
+
+type ResolvedNamingField = {
+  value: string | null;
+  source: NamingSource | null;
+};
+
+type TextBlockSelection = {
+  text: string;
+  startIndex: number;
+  endIndex: number;
+  fontSize: number;
+};
+
+let pdfJsPromise: Promise<PdfJsContext> | null = null;
+
+const ISO_DATE_PATTERN = /\b(19|20)\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/;
+const YEAR_PATTERN = /\b(19|20)\d{2}\b/;
+const INVALID_FILENAME_CHARS = /[<>:"/\\|?*\u0000-\u001f]+/g;
+const SECTION_BREAK_PATTERN = /^(abstract|summary|keywords?|index terms?|introduction)\b/i;
+const TITLE_EXCLUSION_PATTERN =
+  /\b(abstract|keywords?|index terms?|references|copyright|doi|www\.|http|@|arxiv|preprint|proceedings|journal|volume|issue|received|accepted)\b/i;
+const AUTHOR_EXCLUSION_PATTERN =
+  /\b(university|department|school|college|institute|laboratory|lab|center|centre|hospital|faculty|email|e-mail|doi|www\.|http|abstract|keywords?|index terms?|introduction)\b/i;
+const YEAR_KEYWORD_PATTERN =
+  /\b(copyright|published|publication|proceedings|conference|journal|volume|vol\.?|issue|arxiv|preprint|online|article)\b/i;
+const YEAR_PENALTY_PATTERN = /\b(received|revised|accepted|submitted|manuscript)\b/i;
+const PREFERRED_METADATA_KEYS = ['x-default', 'default', 'en-US', 'en', 'und'];
+
+const loadPdfJs = async (): Promise<PdfJsContext> => {
+  if (!pdfJsPromise) {
+    pdfJsPromise = Promise.all([
+      import('pdfjs-dist'),
+      import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+    ]).then(([pdfjs, workerModule]) => {
+      pdfjs.GlobalWorkerOptions.workerSrc = workerModule.default;
+      return {
+        pdfjs,
+        workerUrl: workerModule.default,
+      };
+    });
+  }
+
+  return pdfJsPromise;
+};
+
+const normalizeWhitespace = (value: string): string =>
+  value.replace(/\0/g, '').replace(/\s+/g, ' ').trim();
+
+const stripLeadingNumbering = (value: string): string =>
+  value
+    .replace(/^(\[|\()?(\d{1,5})(\]|\))?[\s._-]*/, '')
+    .replace(/^(P|V|No\.?)?[-_]?\d{1,5}[-_.\s]+/i, '')
+    .trim();
+
+const sanitizeTitle = (title: string | null): string | null => {
+  if (!title) {
+    return null;
+  }
+
+  const normalized = normalizeWhitespace(title)
+    .replace(/\.pdf$/i, '')
+    .replace(INVALID_FILENAME_CHARS, ' ')
+    .trim();
+
+  if (!normalized || /^untitled$/i.test(normalized)) {
+    return null;
+  }
+
+  const cleaned = normalized
+    .replace(/^(\[\d{1,5}\]|\(\d{1,5}\)|(?:P|V|No\.?)\s*[-_]?\d{1,5}|\d{1,5}[._-])[\s._-]*/i, '')
+    .trim();
+
+  return cleaned || normalized;
+};
+
+const collectMetadataStrings = (value: unknown): string[] => {
+  if (typeof value === 'string') {
+    const normalized = normalizeWhitespace(value);
+    return normalized ? [normalized] : [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectMetadataStrings(item));
+  }
+
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const prioritized = PREFERRED_METADATA_KEYS.flatMap((key) =>
+      key in record ? collectMetadataStrings(record[key]) : []
+    );
+
+    if (prioritized.length > 0) {
+      return prioritized;
+    }
+
+    return Object.values(record).flatMap((item) => collectMetadataStrings(item));
+  }
+
+  return [];
+};
+
+const dedupeValues = (values: string[]): string[] => {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values) {
+    const key = value.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(value);
+    }
+  }
+
+  return result;
+};
+
+const normalizeMetadataText = (value: unknown): string | null => {
+  const values = dedupeValues(collectMetadataStrings(value));
+  return values[0] ?? null;
+};
+
+const normalizeMetadataPeople = (value: unknown): string | null => {
+  const values = dedupeValues(collectMetadataStrings(value));
+  return values.length > 0 ? values.join('; ') : null;
+};
+
+const getMetadataValue = (
+  metadata: PdfMetadataHandle,
+  keys: string[],
+  normalizer: (value: unknown) => string | null = normalizeMetadataText
+): string | null => {
+  for (const key of keys) {
+    const normalized = normalizer(metadata?.get(key));
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return null;
+};
+
+const getInfoValue = (
+  info: Record<string, unknown>,
+  keys: string[],
+  normalizer: (value: unknown) => string | null = normalizeMetadataText
+): string | null => {
+  for (const key of keys) {
+    const normalized = normalizer(info[key]);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return null;
+};
+
+const extractYearFromValue = (
+  value: unknown,
+  pdfDateString: PdfDateStringLike
+): string | null => {
+  const normalized = normalizeMetadataText(value);
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = pdfDateString.toDateObject(normalized);
+  if (parsed) {
+    return String(parsed.getFullYear());
+  }
+
+  const match = normalized.match(YEAR_PATTERN);
+  return match ? match[0] : null;
+};
+
+const isPdfTextItem = (item: unknown): item is PdfTextItem =>
+  typeof item === 'object' &&
+  item !== null &&
+  'str' in item &&
+  'transform' in item &&
+  typeof (item as PdfTextItem).str === 'string' &&
+  Array.isArray((item as PdfTextItem).transform);
+
+const computeFontSize = (item: PdfTextItem): number =>
+  Math.max(
+    Math.abs(item.height || 0),
+    Math.abs(Number(item.transform[0]) || 0),
+    Math.abs(Number(item.transform[3]) || 0),
+    1
+  );
+
+const joinLineSegments = (
+  segments: Array<{ text: string; x: number; width: number; fontSize: number }>
+): string => {
+  const sorted = [...segments].sort((a, b) => a.x - b.x);
+  let text = '';
+  let previous: (typeof sorted)[number] | null = null;
+
+  for (const segment of sorted) {
+    if (!previous) {
+      text = segment.text;
+      previous = segment;
+      continue;
+    }
+
+    const gap = segment.x - (previous.x + previous.width);
+    const shouldAddSpace =
+      !text.endsWith('-') &&
+      !/^[,.;:!?)]/.test(segment.text) &&
+      gap > Math.max(1, previous.fontSize * 0.12);
+
+    text += `${shouldAddSpace ? ' ' : ''}${segment.text}`;
+    previous = segment;
+  }
+
+  return normalizeWhitespace(text);
+};
+
+const buildTextLines = (items: unknown[], pageNumber: number): PdfTextLine[] => {
+  const segments = items
+    .filter(isPdfTextItem)
+    .map((item) => ({
+      text: normalizeWhitespace(item.str),
+      x: Number(item.transform[4]) || 0,
+      y: Number(item.transform[5]) || 0,
+      width: Math.abs(Number(item.width) || 0),
+      fontSize: computeFontSize(item),
+    }))
+    .filter((item) => item.text.length > 0)
+    .sort((a, b) => b.y - a.y || a.x - b.x);
+
+  const rows: Array<{
+    y: number;
+    x: number;
+    fontSize: number;
+    segments: Array<{ text: string; x: number; width: number; fontSize: number }>;
+  }> = [];
+
+  for (const segment of segments) {
+    const lastRow = rows[rows.length - 1];
+    const tolerance = Math.max(2, Math.max(lastRow?.fontSize ?? 0, segment.fontSize) * 0.45);
+
+    if (lastRow && Math.abs(lastRow.y - segment.y) <= tolerance) {
+      lastRow.segments.push(segment);
+      lastRow.fontSize = Math.max(lastRow.fontSize, segment.fontSize);
+      lastRow.x = Math.min(lastRow.x, segment.x);
+    } else {
+      rows.push({
+        y: segment.y,
+        x: segment.x,
+        fontSize: segment.fontSize,
+        segments: [segment],
+      });
+    }
+  }
+
+  return rows
+    .map((row) => ({
+      pageNumber,
+      x: row.x,
+      y: row.y,
+      fontSize: row.fontSize,
+      text: joinLineSegments(row.segments),
+    }))
+    .filter((row) => row.text.length > 0);
+};
+
+const getPageTextLines = async (
+  pdfDocument: PdfDocumentLike,
+  pageNumber: number
+): Promise<PdfTextLine[]> => {
+  const page = await pdfDocument.getPage(pageNumber);
+
+  try {
+    const textContent = await page.getTextContent({
+      disableNormalization: false,
+    });
+
+    return buildTextLines(textContent.items, pageNumber);
+  } finally {
+    page.cleanup();
+  }
+};
+
+const findSectionBreakIndex = (lines: PdfTextLine[]): number =>
+  lines.findIndex((line) => SECTION_BREAK_PATTERN.test(line.text));
+
+const isLikelyTitleLine = (text: string): boolean => {
+  if (text.length < 12 || text.length > 220) {
+    return false;
+  }
+
+  const wordCount = text.split(/\s+/).length;
+  if (wordCount < 3 || wordCount > 28) {
+    return false;
+  }
+
+  if (TITLE_EXCLUSION_PATTERN.test(text)) {
+    return false;
+  }
+
+  return /[\p{L}]/u.test(text);
+};
+
+const scoreTitleLine = (line: PdfTextLine, index: number): number => {
+  const wordCount = line.text.split(/\s+/).length;
+  let score = line.fontSize * 6;
+
+  if (line.text.length >= 20 && line.text.length <= 180) {
+    score += 18;
+  }
+
+  if (wordCount >= 4 && wordCount <= 24) {
+    score += 10;
+  }
+
+  if (!/[.@]/.test(line.text)) {
+    score += 4;
+  }
+
+  if (/^[A-Z0-9\s-]+$/.test(line.text) && line.text.length < 18) {
+    score -= 18;
+  }
+
+  score += Math.max(0, 12 - index);
+  return score;
+};
+
+const collectBlockText = (lines: PdfTextLine[], startIndex: number, endIndex: number): string =>
+  normalizeWhitespace(lines.slice(startIndex, endIndex + 1).map((line) => line.text).join(' '));
+
+const extractBodyTitleSelection = (pageLines: PdfTextLine[]): TextBlockSelection | null => {
+  const sectionBreakIndex = findSectionBreakIndex(pageLines);
+  const searchWindow =
+    sectionBreakIndex === -1
+      ? pageLines.slice(0, 14)
+      : pageLines.slice(0, Math.min(sectionBreakIndex, 14));
+
+  let bestIndex = -1;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (let index = 0; index < searchWindow.length; index += 1) {
+    const line = searchWindow[index];
+    if (!isLikelyTitleLine(line.text)) {
+      continue;
+    }
+
+    const score = scoreTitleLine(line, index);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+
+  if (bestIndex === -1) {
+    return null;
+  }
+
+  const baseLine = searchWindow[bestIndex];
+  let startIndex = bestIndex;
+  let endIndex = bestIndex;
+
+  while (startIndex > 0) {
+    const candidate = searchWindow[startIndex - 1];
+    const yDistance = Math.abs(candidate.y - searchWindow[startIndex].y);
+
+    if (
+      isLikelyTitleLine(candidate.text) &&
+      candidate.fontSize >= baseLine.fontSize * 0.75 &&
+      yDistance <= baseLine.fontSize * 2.2
+    ) {
+      startIndex -= 1;
+    } else {
+      break;
+    }
+  }
+
+  while (endIndex + 1 < searchWindow.length) {
+    const candidate = searchWindow[endIndex + 1];
+    const yDistance = Math.abs(candidate.y - searchWindow[endIndex].y);
+
+    if (
+      isLikelyTitleLine(candidate.text) &&
+      candidate.fontSize >= baseLine.fontSize * 0.75 &&
+      yDistance <= baseLine.fontSize * 2.2
+    ) {
+      endIndex += 1;
+    } else {
+      break;
+    }
+  }
+
+  const title = sanitizeTitle(collectBlockText(searchWindow, startIndex, endIndex));
+  if (!title) {
+    return null;
+  }
+
+  return {
+    text: title,
+    startIndex,
+    endIndex,
+    fontSize: baseLine.fontSize,
+  };
+};
+
+const isLikelyAuthorLine = (text: string): boolean => {
+  if (text.length < 4 || text.length > 140) {
+    return false;
+  }
+
+  if (AUTHOR_EXCLUSION_PATTERN.test(text)) {
+    return false;
+  }
+
+  if (SECTION_BREAK_PATTERN.test(text) || TITLE_EXCLUSION_PATTERN.test(text)) {
+    return false;
+  }
+
+  if (/^\d+$/.test(text)) {
+    return false;
+  }
+
+  const wordCount = text.split(/\s+/).length;
+  if (wordCount < 2 || wordCount > 24) {
+    return false;
+  }
+
+  return /[\p{L}]/u.test(text);
+};
+
+const scoreAuthorLine = (text: string, distanceFromTitle: number): number => {
+  let score = 0;
+
+  if (/[;,]/.test(text) || /\band\b/i.test(text)) {
+    score += 12;
+  }
+
+  const capitalizedWordCount = text.match(/\b[\p{Lu}][\p{L}'-]+\b/gu)?.length ?? 0;
+  if (capitalizedWordCount >= 2) {
+    score += 10;
+  }
+
+  if (!/\d{4}/.test(text)) {
+    score += 4;
+  }
+
+  score += Math.max(0, 8 - distanceFromTitle);
+  return score;
+};
+
+const extractBodyAuthor = (
+  pageLines: PdfTextLine[],
+  titleSelection: TextBlockSelection | null
+): string | null => {
+  const sectionBreakIndex = findSectionBreakIndex(pageLines);
+  const startIndex = titleSelection ? titleSelection.endIndex + 1 : 0;
+  const endIndex =
+    sectionBreakIndex === -1
+      ? Math.min(pageLines.length, startIndex + 8)
+      : Math.min(sectionBreakIndex, startIndex + 8);
+
+  if (startIndex >= endIndex) {
+    return null;
+  }
+
+  const candidateLines = pageLines.slice(startIndex, endIndex);
+  let bestLocalIndex = -1;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (let index = 0; index < candidateLines.length; index += 1) {
+    const line = candidateLines[index];
+    if (!isLikelyAuthorLine(line.text)) {
+      continue;
+    }
+
+    const score = scoreAuthorLine(line.text, index);
+    if (score > bestScore) {
+      bestScore = score;
+      bestLocalIndex = index;
+    }
+  }
+
+  if (bestLocalIndex === -1) {
+    return null;
+  }
+
+  let blockStart = bestLocalIndex;
+  let blockEnd = bestLocalIndex;
+  const baseFont = candidateLines[bestLocalIndex].fontSize;
+
+  while (blockStart > 0) {
+    const candidate = candidateLines[blockStart - 1];
+    if (isLikelyAuthorLine(candidate.text) && candidate.fontSize >= baseFont * 0.7) {
+      blockStart -= 1;
+    } else {
+      break;
+    }
+  }
+
+  while (blockEnd + 1 < candidateLines.length) {
+    const candidate = candidateLines[blockEnd + 1];
+    if (isLikelyAuthorLine(candidate.text) && candidate.fontSize >= baseFont * 0.7) {
+      blockEnd += 1;
+    } else {
+      break;
+    }
+  }
+
+  const authors = normalizeWhitespace(
+    candidateLines
+      .slice(blockStart, blockEnd + 1)
+      .map((line) => line.text)
+      .join(' ; ')
+  );
+
+  return authors || null;
+};
+
+const extractBodyYear = (lines: PdfTextLine[]): string | null => {
+  const candidates: Array<{ year: string; score: number }> = [];
+
+  for (const line of lines) {
+    const yearMatches = Array.from(line.text.matchAll(new RegExp(YEAR_PATTERN, 'g'))).map(
+      (match) => match[0]
+    );
+    if (yearMatches.length === 0) {
+      continue;
+    }
+
+    let score = 0;
+
+    if (YEAR_KEYWORD_PATTERN.test(line.text)) {
+      score += 8;
+    }
+
+    if (line.pageNumber === 1) {
+      score += 2;
+    }
+
+    if (line.text.length <= 160) {
+      score += 1;
+    }
+
+    if (YEAR_PENALTY_PATTERN.test(line.text)) {
+      score -= 6;
+    }
+
+    if (score <= 0) {
+      continue;
+    }
+
+    for (const year of yearMatches) {
+      candidates.push({ year, score });
+    }
+  }
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].year;
+};
+
+const extractBodyFieldsFromPdf = async (pdfDocument: PdfDocumentLike): Promise<PdfBodyFields> => {
+  const maxPages = Math.min(pdfDocument.numPages, 2);
+  const pageLines: PdfTextLine[] = [];
+
+  for (let pageNumber = 1; pageNumber <= maxPages; pageNumber += 1) {
+    const lines = await getPageTextLines(pdfDocument, pageNumber);
+    pageLines.push(...lines);
+  }
+
+  const firstPageLines = pageLines.filter((line) => line.pageNumber === 1);
+  const titleSelection = extractBodyTitleSelection(firstPageLines);
+
+  return {
+    title: titleSelection?.text ?? null,
+    author: extractBodyAuthor(firstPageLines, titleSelection),
+    year: extractBodyYear(pageLines),
+  };
+};
+
+const extractDocumentMetadataFields = (
+  info: Record<string, unknown>,
+  metadata: PdfMetadataHandle,
+  pdfDateString: PdfDateStringLike
+): PdfMetadataFields => ({
+  title:
+    sanitizeTitle(
+      getMetadataValue(metadata, ['dc:title', 'pdf:Title', 'xmp:Title']) ??
+        getInfoValue(info, ['Title'])
+    ) ?? null,
+  author:
+    getMetadataValue(metadata, ['dc:creator'], normalizeMetadataPeople) ??
+    getInfoValue(info, ['Author'], normalizeMetadataPeople),
+  year:
+    extractYearFromValue(
+      getMetadataValue(metadata, ['dc:date', 'prism:publicationDate']),
+      pdfDateString
+    ) ?? null,
+});
+
+const resolvePreferredField = (
+  bodyValue: string | null,
+  metadataValue: string | null
+): ResolvedPdfField => {
+  if (bodyValue) {
+    return {
+      value: bodyValue,
+      source: 'body',
+    };
+  }
+
+  if (metadataValue) {
+    return {
+      value: metadataValue,
+      source: 'metadata',
+    };
+  }
+
+  return {
+    value: null,
+    source: null,
+  };
+};
+
+const resolvePreferredCleanName = (
+  bodyTitle: string | null,
+  filename: string,
+  metadataTitle: string | null
+): ResolvedNamingField => {
+  const bodyCleanName = sanitizeTitle(bodyTitle);
+  if (bodyCleanName) {
+    return {
+      value: bodyCleanName,
+      source: 'body',
+    };
+  }
+
+  const filenameCleanName = cleanFilename(filename).clean.trim();
+  if (filenameCleanName) {
+    return {
+      value: filenameCleanName,
+      source: 'filename',
+    };
+  }
+
+  const metadataCleanName = sanitizeTitle(metadataTitle);
+  if (metadataCleanName) {
+    return {
+      value: metadataCleanName,
+      source: 'metadata',
+    };
+  }
+
+  return {
+    value: null,
+    source: null,
+  };
+};
+
+export const extractDateFromFilename = (filename: string): string => {
+  const isoDate = filename.match(ISO_DATE_PATTERN);
+  if (isoDate) {
+    return isoDate[0];
+  }
+
+  const year = filename.match(YEAR_PATTERN);
+  if (year) {
+    return `${year[0]}-01-01`;
+  }
+
+  return new Date().toISOString().split('T')[0];
+};
+
+export const hasDateInFilename = (filename: string): boolean =>
+  ISO_DATE_PATTERN.test(filename) || YEAR_PATTERN.test(filename);
+
+export const extractNumberFromFilename = (filename: string): number | null => {
+  const match = filename.match(/^(\[|\(|P|No\.?)?\s*(\d{1,5})(\]|\)|\.|_|-|\s)/i);
+  return match?.[2] ? parseInt(match[2], 10) : null;
+};
+
+export const cleanFilename = (filename: string): { clean: string; ext: string } => {
+  const lastDotIndex = filename.lastIndexOf('.');
+  const ext = lastDotIndex !== -1 ? filename.slice(lastDotIndex) : '';
+  const nameWithoutExt = lastDotIndex !== -1 ? filename.slice(0, lastDotIndex) : filename;
+
+  let clean = stripLeadingNumbering(nameWithoutExt);
+  if (!clean) {
+    clean = nameWithoutExt;
+  }
+
+  return { clean, ext };
+};
+
+const shouldRetryWithoutWorker = (error: unknown): boolean => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /worker|GlobalWorkerOptions\.workerSrc|Setting up fake worker|Failed to fetch dynamically imported module|imported module|module script/i.test(
+    error.message
+  );
+};
+
+const parsePdfMetadata = async (
+  file: File,
+  useExplicitWorker = true
+): Promise<PDFMetadataResult | null> => {
+  const { pdfjs, workerUrl } = await loadPdfJs();
+  const buffer = await file.arrayBuffer();
+  const data = new Uint8Array(buffer);
+  let pdfWorker: { destroy: () => void } | null = null;
+
+  const loadingTask = (() => {
+    if (!useExplicitWorker) {
+      return pdfjs.getDocument({ data });
+    }
+
+    pdfWorker = pdfjs.PDFWorker.create({
+      port: new Worker(workerUrl, { type: 'module' }),
+    }) as unknown as { destroy: () => void };
+
+    return pdfjs.getDocument({
+      data,
+      worker: pdfWorker as never,
+    });
+  })();
+
+  try {
+    const pdfDocument = (await loadingTask.promise) as unknown as PdfDocumentLike;
+    const { info, metadata } = await pdfDocument.getMetadata();
+
+    const bodyFields = await extractBodyFieldsFromPdf(pdfDocument);
+    const metadataFields = extractDocumentMetadataFields(info, metadata, pdfjs.PDFDateString);
+    const resolvedTitle = resolvePreferredField(bodyFields.title, metadataFields.title);
+    const resolvedAuthor = resolvePreferredField(bodyFields.author, metadataFields.author);
+    const resolvedYear = resolvePreferredField(bodyFields.year, metadataFields.year);
+    const resolvedCleanName = resolvePreferredCleanName(
+      bodyFields.title,
+      file.name,
+      metadataFields.title
+    );
+
+    await pdfDocument.destroy();
+
+    if (
+      !resolvedTitle.value &&
+      !resolvedAuthor.value &&
+      !resolvedYear.value &&
+      !resolvedCleanName.value
+    ) {
+      return null;
+    }
+
+    return {
+      title: resolvedTitle.value,
+      bodyTitle: bodyFields.title,
+      metadataTitle: metadataFields.title,
+      author: resolvedAuthor.value,
+      year: resolvedYear.value,
+      cleanName: resolvedCleanName.value,
+      titleSource: resolvedTitle.source,
+      authorSource: resolvedAuthor.source,
+      yearSource: resolvedYear.source,
+      cleanNameSource: resolvedCleanName.source,
+    };
+  } finally {
+    await loadingTask.destroy().catch(() => undefined);
+    pdfWorker?.destroy();
+  }
+};
+
+export const extractMetadataFromPDF = async (file: File): Promise<PDFMetadataResult | null> => {
+  const isPdfFile = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+  if (!isPdfFile) {
+    return null;
+  }
+
+  try {
+    return await parsePdfMetadata(file);
+  } catch (error) {
+    if (shouldRetryWithoutWorker(error)) {
+      try {
+        return await parsePdfMetadata(file, false);
+      } catch (fallbackError) {
+        console.warn(`Failed to parse PDF data for "${file.name}".`, fallbackError);
+        return null;
+      }
+    }
+
+    console.warn(`Failed to parse PDF data for "${file.name}".`, error);
+    return null;
+  }
+};
+
+export const generateNewFilename = (
+  file: ResearchFile,
+  index: number,
+  rule: RenamingRule
+): string => {
+  let num: number;
+
+  if (rule.mode === 'offset') {
+    const baseNum = file.originalNumber !== null ? file.originalNumber : 0;
+    num = baseNum + rule.offsetValue;
+    if (num < 0) {
+      num = 0;
+    }
+  } else {
+    num = rule.startNumber + index;
+  }
+
+  const numStr = num.toString().padStart(rule.minDigits, '0');
+  let prefixPart = '';
+
+  switch (rule.formatType) {
+    case NumberFormat.Brackets:
+      prefixPart = `[${numStr}]`;
+      break;
+    case NumberFormat.Dot:
+      prefixPart = `${numStr}.`;
+      break;
+    case NumberFormat.Underscore:
+      prefixPart = `${numStr}_`;
+      break;
+    case NumberFormat.Hyphen:
+      prefixPart = `${numStr}-`;
+      break;
+    case NumberFormat.Custom:
+      prefixPart = `${rule.customPrefix}${numStr}`;
+      break;
+  }
+
+  return `${prefixPart}${rule.customSuffix}${file.cleanName}${file.extension}`;
+};
+
+export const generateSequenceNumberLabel = (
+  file: ResearchFile,
+  index: number,
+  rule: RenamingRule
+): string => {
+  let num: number;
+
+  if (rule.mode === 'offset') {
+    const baseNum = file.originalNumber !== null ? file.originalNumber : 0;
+    num = baseNum + rule.offsetValue;
+    if (num < 0) {
+      num = 0;
+    }
+  } else {
+    num = rule.startNumber + index;
+  }
+
+  return num.toString().padStart(rule.minDigits, '0');
+};
+
+const escapeCsvValue = (value: string): string => {
+  const normalized = value.replace(/\r?\n/g, ' ');
+  const escaped = normalized.replace(/"/g, '""');
+
+  if (/[",\n]/.test(normalized)) {
+    return `"${escaped}"`;
+  }
+
+  return escaped;
+};
+
+export const generateResearchListCsv = (
+  files: ResearchFile[],
+  rule: RenamingRule
+): string => {
+  const headers = ['缂栧彿', '鏂囦欢鍚?, '鏃堕棿'];
+  const rows = files.map((file, index) =>
+    [
+      generateSequenceNumberLabel(file, index, rule),
+      `${file.cleanName}${file.extension}`,
+      file.publicationDate,
+    ]
+      .map((value) => escapeCsvValue(value))
+      .join(',')
+  );
+
+  return [headers.join(','), ...rows].join('\r\n');
+};
+
+=== components/IconComponents.tsx ===
+import { 
+  UploadCloud, 
+  FileText, 
+  X, 
+  Settings, 
+  Download, 
+  RefreshCw, 
+  ArrowUpDown,
+  Calendar,
+  Trash2,
+  FileArchive,
+  Menu,
+  Check
+} from 'lucide-react';
+
+export {
+  UploadCloud,
+  FileText,
+  X,
+  Settings,
+  Download,
+  RefreshCw,
+  ArrowUpDown,
+  Calendar,
+  Trash2,
+  FileArchive,
+  Menu,
+  Check
+};
+
+=== components/FileTable.tsx ===
+import React, { useState } from 'react';
+import {
+  DndContext,
+  DragEndEvent,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import { NamingSource, ResearchFile, RenamingRule, SortOrder } from '../types';
+import { generateNewFilename } from '../utils/fileUtils';
+import { ArrowUpDown, Calendar, FileText, Menu, Trash2 } from './IconComponents';
+
+interface FileTableProps {
+  files: ResearchFile[];
+  rule: RenamingRule;
+  onRemove: (id: string) => void;
+  onDateChange: (id: string, date: string) => void;
+  onReorder: (activeId: string, overId: string) => void;
+  sortOrder: SortOrder;
+  onSortChange: (order: SortOrder) => void;
+  onNameSourceChange: (id: string, source: NamingSource) => void;
+}
+
+interface SortableRowProps {
+  file: ResearchFile;
+  index: number;
+  rule: RenamingRule;
+  isManualSort: boolean;
+  onRemove: (id: string) => void;
+  onDateChange: (id: string, date: string) => void;
+  onNameSourceChange: (id: string, source: NamingSource) => void;
+}
+
+interface HeaderLabelProps {
+  zh: string;
+  en: string;
+  align?: 'left' | 'center' | 'right';
+  accent?: boolean;
+}
+
+interface ExpandableTextProps {
+  value: string;
+  tone?: 'muted' | 'strong';
+  highlight?: boolean;
+  collapsedLines?: 1 | 2;
+}
+
+const metadataStatusStyles: Record<'pending' | 'parsed' | 'unavailable', string> = {
+  pending: 'bg-amber-50 text-amber-700 border-amber-200',
+  parsed: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  unavailable: 'bg-slate-100 text-slate-600 border-slate-200',
+};
+
+const metadataStatusLabels: Record<'pending' | 'parsed' | 'unavailable', string> = {
+  pending: 'PDF瑙ｆ瀽涓?/ PDF Parsing',
+  parsed: 'PDF宸茶В鏋?/ PDF Parsed',
+  unavailable: '鏃燩DF鏁版嵁 / No PDF Data',
+};
+
+const namingSourceOptions: Array<{
+  value: NamingSource;
+  zh: string;
+  en: string;
+}> = [
+  { value: 'filename', zh: '鏂囦欢鍚?, en: 'Filename' },
+  { value: 'body', zh: '姝ｆ枃鏍囬', en: 'Body Title' },
+  { value: 'metadata', zh: '鍏冩暟鎹爣棰?, en: 'Metadata Title' },
+];
+
+const multilineClampClass =
+  'overflow-hidden break-words [display:-webkit-box] [-webkit-box-orient:vertical]';
+
+const HeaderLabel: React.FC<HeaderLabelProps> = ({
+  zh,
+  en,
+  align = 'left',
+  accent = false,
+}) => {
+  const alignmentClass =
+    align === 'center'
+      ? 'items-center text-center'
+      : align === 'right'
+        ? 'items-end text-right'
+        : 'items-start text-left';
+
+  return (
+    <div className={`flex flex-col gap-0.5 leading-tight ${alignmentClass}`}>
+      <span className={accent ? 'font-semibold text-primary-700' : 'font-semibold text-slate-700'}>
+        {zh}
+      </span>
+      <span className="text-[11px] font-medium normal-case tracking-normal text-slate-400">
+        {en}
+      </span>
+    </div>
+  );
+};
+
+const ExpandableText: React.FC<ExpandableTextProps> = ({
+  value,
+  tone = 'muted',
+  highlight = false,
+  collapsedLines = 1,
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  const isExpandable = value.length > 48 || value.includes('\n');
+
+  const wrapperClass =
+    tone === 'strong'
+      ? `rounded-md px-2 py-1 ${highlight ? 'bg-slate-100/60' : 'bg-transparent'}`
+      : 'rounded-md';
+
+  const textClass =
+    tone === 'strong'
+      ? 'text-sm font-medium text-slate-800 leading-5'
+      : 'text-sm text-slate-500 leading-5';
+
+  const hoverClass = isExpandable
+    ? tone === 'strong'
+      ? 'cursor-pointer hover:bg-slate-100'
+      : 'cursor-pointer hover:bg-slate-50'
+    : '';
+
+  const collapsedClass =
+    collapsedLines === 1
+      ? 'overflow-hidden text-ellipsis whitespace-nowrap'
+      : `${multilineClampClass} [-webkit-line-clamp:2]`;
+
+  const title = isExpandable
+    ? expanded
+      ? '鐐瑰嚮鏀惰捣瀹屾暣鏂囦欢鍚?/ Click to collapse full name'
+      : '鐐瑰嚮灞曞紑瀹屾暣鏂囦欢鍚?/ Click to expand full name'
+    : value;
+
+  return (
+    <button
+      type="button"
+      onClick={isExpandable ? () => setExpanded((prev) => !prev) : undefined}
+      disabled={!isExpandable}
+      title={title}
+      className={`group block w-full text-left transition-colors ${isExpandable ? '' : 'cursor-default'}`}
+    >
+      <div className={`${wrapperClass} ${hoverClass}`}>
+        <div className="flex items-start gap-2">
+          <div
+            className={`min-w-0 flex-1 break-words select-text ${
+              !expanded && isExpandable ? collapsedClass : ''
+            } ${textClass}`}
+          >
+            {value}
+          </div>
+          {isExpandable && (
+            <span className="shrink-0 pt-0.5 text-[10px] font-medium text-primary-600 opacity-80 group-hover:opacity-100">
+              {expanded ? '鏀惰捣' : '灞曞紑'}
+            </span>
+          )}
+        </div>
+      </div>
+    </button>
+  );
+};
+
+const SortableRow: React.FC<SortableRowProps> = ({
+  file,
+  index,
+  rule,
+  isManualSort,
+  onRemove,
+  onDateChange,
+  onNameSourceChange,
+}) => {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: file.id,
+    disabled: !isManualSort,
+  });
+
+  const newName = generateNewFilename(file, index, rule);
+  const metadataSummary = [
+    file.pdfMetadata?.title
+      ? `Title (${file.pdfMetadata.titleSource ?? 'unknown'}): ${file.pdfMetadata.title}`
+      : null,
+    file.pdfMetadata?.author
+      ? `Author (${file.pdfMetadata.authorSource ?? 'unknown'}): ${file.pdfMetadata.author}`
+      : null,
+    file.pdfMetadata?.year
+      ? `Year (${file.pdfMetadata.yearSource ?? 'unknown'}): ${file.pdfMetadata.year}`
+      : null,
+  ].filter((item): item is string => Boolean(item));
+
+  const sourceAvailability: Record<NamingSource, boolean> = {
+    filename: true,
+    body: Boolean(file.pdfMetadata?.bodyTitle),
+    metadata: Boolean(file.pdfMetadata?.metadataTitle),
+  };
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  return (
+    <tr
+      ref={setNodeRef}
+      style={style}
+      className={`group transition-colors ${
+        isDragging
+          ? 'bg-primary-50 shadow-lg relative z-20'
+          : file.duplicatedName
+            ? 'bg-red-50/70 hover:bg-red-100/60'
+            : 'hover:bg-slate-50/80'
+      }`}
+    >
+      <td className="px-4 py-3 align-middle">
+        <button
+          type="button"
+          {...attributes}
+          {...listeners}
+          disabled={!isManualSort}
+          className={`inline-flex h-8 w-8 items-center justify-center rounded-md border transition-colors ${
+            isManualSort
+              ? 'border-slate-200 bg-white text-slate-400 hover:border-primary-300 hover:text-primary-600 cursor-grab active:cursor-grabbing'
+              : 'border-transparent bg-transparent text-slate-200 cursor-not-allowed'
+          }`}
+          title={
+            isManualSort
+              ? '鎷栨嫿璋冩暣椤哄簭 / Drag to reorder'
+              : '鍒囨崲鍒版墜鍔ㄦ帓搴忓悗鍙嫋鎷?/ Switch to manual sort to drag'
+          }
+        >
+          <Menu className="w-4 h-4" />
+        </button>
+      </td>
+      <td className="px-6 py-3">
+        {rule.mode === 'sequential' ? (
+          <div className="relative flex items-center">
+            <Calendar className="w-3 h-3 text-slate-400 absolute left-2 pointer-events-none" />
+            <input
+              type="date"
+              value={file.publicationDate}
+              onChange={(e) => onDateChange(file.id, e.target.value)}
+              className={`pl-7 pr-2 py-1 rounded border text-sm w-36 focus:ring-1 focus:ring-primary-500 focus:border-primary-500 ${
+                file.manualOverride
+                  ? 'border-primary-300 bg-primary-50 text-primary-800 font-medium'
+                  : 'border-slate-200 text-slate-600'
+              }`}
+            />
+          </div>
+        ) : (
+          <div className="text-sm font-mono font-medium text-slate-600 bg-slate-100 px-2 py-1 rounded w-fit">
+            {file.originalNumber !== null ? file.originalNumber : '-'}
+          </div>
+        )}
+      </td>
+      <td className="px-6 py-3">
+        <div className="space-y-1.5 min-w-0">
+          <ExpandableText value={file.originalName} collapsedLines={1} />
+          {file.pdfMetadataStatus && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span
+                className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${metadataStatusStyles[file.pdfMetadataStatus]}`}
+              >
+                {metadataStatusLabels[file.pdfMetadataStatus]}
+              </span>
+            </div>
+          )}
+        </div>
+      </td>
+      <td className="px-6 py-3">
+        <div className="space-y-1.5 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <label className="inline-flex items-center gap-2 rounded-md border border-slate-200 bg-white px-2 py-1">
+              <span className="text-[11px] text-slate-500">鏉ユ簮 / Source</span>
+              <select
+                value={file.nameSource}
+                onChange={(e) => onNameSourceChange(file.id, e.target.value as NamingSource)}
+                className="bg-transparent text-[11px] font-medium text-slate-700 outline-none"
+              >
+                {namingSourceOptions.map((option) => (
+                  <option
+                    key={option.value}
+                    value={option.value}
+                    disabled={!sourceAvailability[option.value]}
+                  >
+                    {option.zh} / {option.en}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="flex items-start gap-2 min-w-0">
+            <div className="min-w-0 flex-1">
+              <ExpandableText value={newName} tone="strong" highlight collapsedLines={1} />
+            </div>
+            {file.duplicatedName && (
+              <span className="inline-flex shrink-0 items-center rounded-full border border-red-200 bg-red-50 px-2 py-1 text-[11px] font-medium text-red-700">
+                鈿?Duplicate
+              </span>
+            )}
+          </div>
+          {metadataSummary.length > 0 && (
+            <div
+              className="overflow-hidden text-ellipsis whitespace-nowrap text-xs text-slate-500 leading-5"
+              title={metadataSummary.join(' | ')}
+            >
+              {metadataSummary.join(' | ')}
+            </div>
+          )}
+        </div>
+      </td>
+      <td className="px-6 py-3 text-right">
+        <button
+          onClick={() => onRemove(file.id)}
+          className="text-slate-300 hover:text-red-500 p-1 rounded hover:bg-red-50 transition-colors"
+          title="鍒犻櫎鏂囦欢 / Remove file"
+        >
+          <Trash2 className="w-4 h-4" />
+        </button>
+      </td>
+    </tr>
+  );
+};
+
+export const FileTable: React.FC<FileTableProps> = ({
+  files,
+  rule,
+  onRemove,
+  onDateChange,
+  onReorder,
+  sortOrder,
+  onSortChange,
+  onNameSourceChange,
+}) => {
+  const isManualSort = sortOrder === 'manual';
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: {
+        distance: 8,
+      },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    })
+  );
+
+  if (files.length === 0) {
+    return null;
+  }
+
+  const toggleSort = () => {
+    if (sortOrder === 'newest') {
+      onSortChange('oldest');
+      return;
+    }
+
+    if (sortOrder === 'oldest') {
+      onSortChange('number');
+      return;
+    }
+
+    if (sortOrder === 'number') {
+      onSortChange('name');
+      return;
+    }
+
+    if (sortOrder === 'name') {
+      onSortChange('manual');
+      return;
+    }
+
+    onSortChange('newest');
+  };
+
+  const getSortLabel = () => {
+    switch (sortOrder) {
+      case 'newest':
+        return '鏈€鏂颁紭鍏?/ Newest First';
+      case 'oldest':
+        return '鏈€鏃т紭鍏?/ Oldest First';
+      case 'name':
+        return '鍚嶇О鎺掑簭 / Name';
+      case 'number':
+        return '鍘熺紪鍙?/ Original Number';
+      case 'manual':
+        return '鎵嬪姩鎷栨嫿 / Manual Drag';
+    }
+  };
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    if (!isManualSort) {
+      return;
+    }
+
+    const { active, over } = event;
+    if (!over || active.id === over.id) {
+      return;
+    }
+
+    onReorder(String(active.id), String(over.id));
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col h-full">
+      <div className="px-6 py-4 border-b border-slate-100 flex flex-col gap-3 bg-slate-50/50 lg:flex-row lg:items-center lg:justify-between">
+        <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+          <FileText className="w-4 h-4 text-slate-500" />
+          鏂囦欢鍒楄〃 (Files) 路 {files.length}
+        </h3>
+
+        <div className="flex flex-wrap items-center gap-3 lg:justify-end">
+          {isManualSort && (
+            <span className="text-xs text-slate-500 hidden xl:inline">
+              鎷栨嫿琛屼互璋冩暣缂栧彿椤哄簭 (Drag rows to change numbering order)
+            </span>
+          )}
+          <button
+            onClick={toggleSort}
+            className="flex items-center gap-2 text-sm text-primary-700 hover:text-primary-800 bg-primary-50 hover:bg-primary-100 px-3 py-2 rounded-md transition-colors"
+          >
+            <ArrowUpDown className="w-3.5 h-3.5" />
+            <span>鎺掑簭 (Sort): {getSortLabel()}</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="overflow-auto flex-1 p-0">
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+          <table className="w-full min-w-[1120px] table-fixed text-left border-collapse">
+            <thead className="bg-slate-50 sticky top-0 z-10 text-xs text-slate-500">
+              <tr>
+                <th className="px-4 py-3 border-b border-slate-200 w-16 text-center">
+                  <HeaderLabel zh="鎷栨嫿" en="Drag" align="center" />
+                </th>
+                {rule.mode === 'sequential' ? (
+                  <th className="px-6 py-3 border-b border-slate-200 w-[18%]">
+                    <HeaderLabel zh="鍙戝竷鏃ユ湡" en="Publication Date" />
+                  </th>
+                ) : (
+                  <th className="px-6 py-3 border-b border-slate-200 w-[18%]">
+                    <HeaderLabel zh="鍘熺紪鍙? en="Original Number" />
+                  </th>
+                )}
+                <th className="px-6 py-3 border-b border-slate-200 w-[29%]">
+                  <HeaderLabel zh="鍘熷鏂囦欢" en="Original File" />
+                </th>
+                <th className="px-6 py-3 border-b border-slate-200 w-[39%] text-primary-700">
+                  <HeaderLabel zh="鐢熸垚鍚嶇О" en="Generated Name" accent />
+                </th>
+                <th className="px-6 py-3 border-b border-slate-200 w-20 text-right">
+                  <HeaderLabel zh="鎿嶄綔" en="Actions" align="right" />
+                </th>
+              </tr>
+            </thead>
+            <SortableContext
+              items={files.map((file) => file.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              <tbody className="divide-y divide-slate-100">
+                {files.map((file, index) => (
+                  <SortableRow
+                    key={file.id}
+                    file={file}
+                    index={index}
+                    rule={rule}
+                    isManualSort={isManualSort}
+                    onRemove={onRemove}
+                    onDateChange={onDateChange}
+                    onNameSourceChange={onNameSourceChange}
+                  />
+                ))}
+              </tbody>
+            </SortableContext>
+          </table>
+        </DndContext>
+      </div>
+
+      <div className="px-6 py-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-400 text-center">
+        {isManualSort
+          ? '鎻愮ず锛氭墜鍔ㄦ嫋鎷藉悗鐨勯『搴忎細鐩存帴褰卞搷 sequential 妯″紡涓嬬殑鏂扮紪鍙风敓鎴愩€?
+          : rule.mode === 'sequential'
+            ? '鎻愮ず锛氶粯璁や娇鐢ㄦ枃浠跺悕锛涙瘡涓枃浠堕兘鍙互鍗曠嫭鍒囨崲涓烘鏂囨爣棰樻垨 metadata 鏍囬銆?
+            : '鎻愮ず锛歄ffset 妯″紡浼氫繚鐣欏師濮嬬紪鍙峰熀鍑嗭紝鍚屾椂缁х画鏄剧ず姣忎釜鏂囦欢褰撳墠鐨勫懡鍚嶆潵婧愩€?}
+      </div>
+    </div>
+  );
+};
+
+=== components/Toolbar.tsx ===
+import React from 'react';
+import { NumberFormat, RenamingRule, SortOrder } from '../types';
+import { ArrowUpDown, Calendar, Settings } from './IconComponents';
+
+interface ToolbarProps {
+  rule: RenamingRule;
+  setRule: (rule: RenamingRule) => void;
+  fileCount: number;
+  sortOrder: SortOrder;
+}
+
+const getSortOrderLabel = (sortOrder: SortOrder): string => {
+  switch (sortOrder) {
+    case 'newest':
+      return '鏈€鏂颁紭鍏?;
+    case 'oldest':
+      return '鏈€鏃т紭鍏?;
+    case 'name':
+      return '鍚嶇О鎺掑簭';
+    case 'number':
+      return '鍘熺紪鍙?;
+    case 'manual':
+      return '鎵嬪姩鎷栨嫿';
+  }
+};
+
+export const Toolbar: React.FC<ToolbarProps> = ({ rule, setRule, fileCount, sortOrder }) => {
+  const handleChange = (key: keyof RenamingRule, value: string | number) => {
+    setRule({ ...rule, [key]: value });
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 h-fit lg:sticky lg:top-6 space-y-6">
+      <div className="flex items-center gap-2 text-slate-800 font-semibold border-b border-slate-100 pb-3">
+        <Settings className="w-5 h-5 text-primary-600" />
+        <h2>缂栧彿瑙勫垯閰嶇疆 (Settings)</h2>
+      </div>
+
+      <div className="flex bg-slate-100 p-1 rounded-lg">
+        <button
+          onClick={() => handleChange('mode', 'sequential')}
+          className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 ${
+            rule.mode === 'sequential'
+              ? 'bg-white text-primary-700 shadow-sm'
+              : 'text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          <Calendar className="w-3.5 h-3.5" />
+          鏃堕棿鎺掑簭閲嶆帓
+        </button>
+        <button
+          onClick={() => handleChange('mode', 'offset')}
+          className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 ${
+            rule.mode === 'offset'
+              ? 'bg-white text-primary-700 shadow-sm'
+              : 'text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          <ArrowUpDown className="w-3.5 h-3.5" />
+          鏁翠綋骞崇Щ绉诲彿
+        </button>
+      </div>
+
+      <div className="space-y-4">
+        {rule.mode === 'sequential' ? (
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">
+              璧峰缂栧彿 (Start From)
+            </label>
+            <div className="relative">
+              <input
+                type="number"
+                value={rule.startNumber}
+                onChange={(e) => handleChange('startNumber', parseInt(e.target.value, 10) || 0)}
+                className="w-full pl-3 pr-3 py-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-colors"
+              />
+              <div className="absolute right-3 top-2 text-xs text-slate-400 pointer-events-none">
+                e.g., 1
+              </div>
+            </div>
+            <p className="text-xs text-slate-500 mt-1">鎸夋椂闂存帓搴忓悗锛岄噸鏂扮敓鎴愯繛缁紪鍙?(1, 2, 3...)</p>
+          </div>
+        ) : (
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">
+              鏁翠綋鍋忕Щ鍊?(Offset Value)
+            </label>
+            <div className="relative">
+              <input
+                type="number"
+                value={rule.offsetValue}
+                onChange={(e) => handleChange('offsetValue', parseInt(e.target.value, 10) || 0)}
+                className="w-full pl-3 pr-3 py-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-colors font-mono"
+                placeholder="+0"
+              />
+              <div className="absolute right-3 top-2 text-xs text-slate-400 pointer-events-none">
+                e.g., +2, -1
+              </div>
+            </div>
+            <p className="text-xs text-slate-500 mt-1">
+              鍩轰簬鍘熺紪鍙锋暣浣撳钩绉伙紝閫傚悎琛ュ彿鎴栨暣浣撻『寤?(1, 3 鈫?3, 5)
+            </p>
+          </div>
+        )}
+
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1">
+            鐩爣缂栧彿鏍峰紡 (Target Format)
+          </label>
+          <select
+            value={rule.formatType}
+            onChange={(e) => handleChange('formatType', e.target.value as NumberFormat)}
+            className="w-full pl-3 pr-10 py-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white"
+          >
+            <option value={NumberFormat.Brackets}>[01] 鏂规嫭鍙?/option>
+            <option value={NumberFormat.Dot}>01. 鐐瑰彿</option>
+            <option value={NumberFormat.Underscore}>01_ 涓嬪垝绾?/option>
+            <option value={NumberFormat.Hyphen}>01- 杩炲瓧绗?/option>
+            <option value={NumberFormat.Custom}>鑷畾涔夊墠缂€</option>
+          </select>
+        </div>
+
+        {rule.formatType === NumberFormat.Custom && (
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">
+              鑷畾涔夊墠缂€ (Prefix)
+            </label>
+            <input
+              type="text"
+              value={rule.customPrefix}
+              onChange={(e) => handleChange('customPrefix', e.target.value)}
+              placeholder="e.g. P-"
+              className="w-full px-3 py-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-primary-500"
+            />
+          </div>
+        )}
+
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1">
+            杩炴帴绗?(Separator)
+          </label>
+          <input
+            type="text"
+            value={rule.customSuffix}
+            onChange={(e) => handleChange('customSuffix', e.target.value)}
+            placeholder=" "
+            className="w-full px-3 py-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-primary-500 font-mono text-sm"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1">
+            鏈€灏忎綅鏁?(Min Digits)
+          </label>
+          <div className="flex items-center gap-3">
+            <input
+              type="range"
+              min="1"
+              max="5"
+              step="1"
+              value={rule.minDigits}
+              onChange={(e) => handleChange('minDigits', parseInt(e.target.value, 10))}
+              className="flex-1 accent-primary-600 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer"
+            />
+            <span className="font-mono text-slate-700 bg-slate-100 px-2 py-1 rounded text-sm">
+              {String(1).padStart(rule.minDigits, '0')}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-slate-50 rounded-lg p-4 border border-slate-100">
+        <h3 className="text-xs font-semibold text-slate-500 mb-2">棰勮鐘舵€?/h3>
+        <div className="flex justify-between items-center text-sm">
+          <span className="text-slate-600">鎺掑簭妯″紡锛?/span>
+          <span className="font-bold text-primary-700">{getSortOrderLabel(sortOrder)}</span>
+        </div>
+        <div className="flex justify-between items-center text-sm mt-1">
+          <span className="text-slate-600">鏂囦欢鏁帮細</span>
+          <span className="font-bold text-slate-900">{fileCount}</span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+=== App.tsx ===
+import React, { startTransition, useCallback, useMemo, useState } from 'react';
+import JSZip from 'jszip';
+import { arrayMove } from '@dnd-kit/sortable';
+import {
+  NamingSource,
+  NumberFormat,
+  PDFMetadataResult,
+  RenamingRule,
+  ResearchFile,
+  SortOrder,
+} from './types';
+import {
+  cleanFilename,
+  extractDateFromFilename,
+  extractMetadataFromPDF,
+  extractNumberFromFilename,
+  generateNewFilename,
+  generateResearchListCsv,
+} from './utils/fileUtils';
+import { FileTable } from './components/FileTable';
+import { Toolbar } from './components/Toolbar';
+import { Download, FileArchive, RefreshCw, UploadCloud } from './components/IconComponents';
+
+const resolveActiveCleanName = (
+  file: Pick<ResearchFile, 'filenameCleanName' | 'pdfMetadata'>,
+  preferredSource: NamingSource,
+  metadataOverride?: PDFMetadataResult | null
+): { cleanName: string; nameSource: NamingSource } => {
+  const metadata = metadataOverride ?? file.pdfMetadata;
+
+  if (preferredSource === 'body' && metadata?.bodyTitle) {
+    return {
+      cleanName: metadata.bodyTitle,
+      nameSource: 'body',
+    };
+  }
+
+  if (preferredSource === 'metadata' && metadata?.metadataTitle) {
+    return {
+      cleanName: metadata.metadataTitle,
+      nameSource: 'metadata',
+    };
+  }
+
+  return {
+    cleanName: file.filenameCleanName,
+    nameSource: 'filename',
+  };
+};
+
+const getDuplicateNameKey = (file: Pick<ResearchFile, 'cleanName' | 'extension'>) =>
+  `${file.cleanName.trim().toLocaleLowerCase()}::${file.extension.trim().toLocaleLowerCase()}`;
+
+const App: React.FC = () => {
+  const [files, setFiles] = useState<ResearchFile[]>([]);
+  const [sortOrder, setSortOrder] = useState<SortOrder>('newest');
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const [rule, setRule] = useState<RenamingRule>({
+    mode: 'sequential',
+    startNumber: 1,
+    offsetValue: 0,
+    formatType: NumberFormat.Brackets,
+    customPrefix: 'P',
+    customSuffix: ' ',
+    minDigits: 2,
+  });
+
+  const applyPdfMetadata = useCallback((id: string, metadata: PDFMetadataResult) => {
+    startTransition(() => {
+      setFiles((prev) =>
+        prev.map((file) =>
+          file.id === id
+            ? (() => {
+                const resolvedNaming = resolveActiveCleanName(file, file.nameSource, metadata);
+
+                return {
+                  ...file,
+                  cleanName: resolvedNaming.cleanName,
+                  nameSource: resolvedNaming.nameSource,
+                  pdfMetadata: metadata,
+                  pdfMetadataStatus: 'parsed',
+                };
+              })()
+            : file
+        )
+      );
+    });
+  }, []);
+
+  const markPdfMetadataUnavailable = useCallback((id: string) => {
+    startTransition(() => {
+      setFiles((prev) =>
+        prev.map((file) =>
+          file.id === id
+            ? {
+                ...file,
+                pdfMetadataStatus: 'unavailable',
+              }
+            : file
+        )
+      );
+    });
+  }, []);
+
+  const hydratePdfMetadata = useCallback(
+    async (pendingFiles: ResearchFile[]) => {
+      for (const file of pendingFiles) {
+        const isPdfFile =
+          file.originalFile.type === 'application/pdf' || file.extension.toLowerCase() === '.pdf';
+
+        if (!isPdfFile) {
+          continue;
+        }
+
+        const metadata = await extractMetadataFromPDF(file.originalFile);
+        if (metadata) {
+          applyPdfMetadata(file.id, metadata);
+        } else {
+          markPdfMetadataUnavailable(file.id);
+        }
+
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 0);
+        });
+      }
+    },
+    [applyPdfMetadata, markPdfMetadataUnavailable]
+  );
+
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const uploadedFiles = event.target.files ? Array.from(event.target.files) : [];
+
+    if (uploadedFiles.length > 0) {
+      const newFiles: ResearchFile[] = uploadedFiles.map((file) => {
+        const { clean, ext } = cleanFilename(file.name);
+        const extractedDate = extractDateFromFilename(file.name);
+        const extractedNumber = extractNumberFromFilename(file.name);
+
+        return {
+          id: Math.random().toString(36).substring(2, 9) + Date.now().toString(36),
+          originalFile: file,
+          originalName: file.name,
+          filenameCleanName: clean,
+          cleanName: clean,
+          extension: ext,
+          duplicatedName: false,
+          publicationDate: extractedDate,
+          manualOverride: false,
+          originalNumber: extractedNumber,
+          nameSource: 'filename',
+          pdfMetadata: null,
+          pdfMetadataStatus:
+            file.type === 'application/pdf' || ext.toLowerCase() === '.pdf' ? 'pending' : null,
+        };
+      });
+
+      setFiles((prev) => [...prev, ...newFiles]);
+      void hydratePdfMetadata(newFiles);
+    }
+
+    event.target.value = '';
+  };
+
+  const removeFile = (id: string) => {
+    setFiles((prev) => prev.filter((file) => file.id !== id));
+  };
+
+  const updateFileDate = (id: string, date: string) => {
+    setFiles((prev) =>
+      prev.map((file) =>
+        file.id === id ? { ...file, publicationDate: date, manualOverride: true } : file
+      )
+    );
+  };
+
+  const reorderFiles = useCallback((activeId: string, overId: string) => {
+    setFiles((prev) => {
+      const oldIndex = prev.findIndex((file) => file.id === activeId);
+      const newIndex = prev.findIndex((file) => file.id === overId);
+
+      if (oldIndex === -1 || newIndex === -1 || oldIndex === newIndex) {
+        return prev;
+      }
+
+      return arrayMove(prev, oldIndex, newIndex);
+    });
+  }, []);
+
+  const updateFileNameSource = useCallback((id: string, nextSource: NamingSource) => {
+    startTransition(() => {
+      setFiles((prev) =>
+        prev.map((file) =>
+          file.id === id
+            ? (() => {
+                const resolvedNaming = resolveActiveCleanName(file, nextSource);
+
+                return {
+                  ...file,
+                  cleanName: resolvedNaming.cleanName,
+                  nameSource: resolvedNaming.nameSource,
+                };
+              })()
+            : file
+        )
+      );
+    });
+  }, []);
+
+  const resetAll = () => {
+    if (confirm('纭畾瑕佹竻绌哄叏閮ㄦ枃浠跺悧锛?)) {
+      setFiles([]);
+    }
+  };
+
+  const sortedFiles = useMemo(() => {
+    const sorted = sortOrder === 'manual' ? [...files] : [...files];
+
+    if (sortOrder !== 'manual') {
+      sorted.sort((a, b) => {
+        if (sortOrder === 'name') {
+          return a.cleanName.localeCompare(b.cleanName);
+        }
+
+        if (sortOrder === 'number') {
+          const numA = a.originalNumber ?? Number.MAX_SAFE_INTEGER;
+          const numB = b.originalNumber ?? Number.MAX_SAFE_INTEGER;
+          return numA - numB;
+        }
+
+        const dateA = new Date(a.publicationDate).getTime();
+        const dateB = new Date(b.publicationDate).getTime();
+
+        if (sortOrder === 'newest') {
+          return dateB - dateA;
+        }
+
+        return dateA - dateB;
+      });
+    }
+
+    const duplicateCounts = new Map<string, number>();
+
+    sorted.forEach((file) => {
+      const duplicateKey = getDuplicateNameKey(file);
+      duplicateCounts.set(duplicateKey, (duplicateCounts.get(duplicateKey) ?? 0) + 1);
+    });
+
+    return sorted.map((file) => {
+      const duplicateKey = getDuplicateNameKey(file);
+
+      return {
+        ...file,
+        duplicatedName: (duplicateCounts.get(duplicateKey) ?? 0) > 1,
+      };
+    });
+  }, [files, sortOrder]);
+
+  const handleCsvExport = () => {
+    if (sortedFiles.length === 0 || isProcessing) {
+      return;
+    }
+
+    try {
+      const csvContent = generateResearchListCsv(sortedFiles, rule);
+      const blob = new Blob(['\uFEFF', csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `Research_List_${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('CSV export failed', error);
+      alert('CSV 瀵煎嚭澶辫触锛岃閲嶈瘯銆?);
+    }
+  };
+
+  const handleZipExport = async () => {
+    if (sortedFiles.length === 0) {
+      return;
+    }
+
+    setIsProcessing(true);
+
+    try {
+      const zip = new JSZip();
+
+      sortedFiles.forEach((file, index) => {
+        const newName = generateNewFilename(file, index, rule);
+        zip.file(newName, file.originalFile);
+      });
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `Renamed_Research_Files_${new Date().toISOString().slice(0, 10)}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('ZIP export failed', error);
+      alert('ZIP 瀵煎嚭澶辫触锛岃閲嶈瘯銆?);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col">
+      <header className="bg-white border-b border-slate-200 shadow-sm sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="bg-primary-600 p-2 rounded-lg">
+              <FileArchive className="w-5 h-5 text-white" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-slate-900 tracking-tight">ResearchRenamer</h1>
+              <p className="text-xs text-slate-500 hidden sm:block">绉戠爺鎴愭灉鏂囦欢缂栧彿鎵归噺绠＄悊搴旂敤</p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {files.length > 0 && (
+              <button
+                onClick={resetAll}
+                className="text-slate-500 hover:text-slate-700 px-3 py-2 text-sm font-medium transition-colors"
+              >
+                娓呯┖ (Clear)
+              </button>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="flex flex-col lg:flex-row gap-8">
+          <aside className="w-full lg:w-80 flex-shrink-0 order-2 lg:order-1">
+            <Toolbar
+              rule={rule}
+              setRule={setRule}
+              fileCount={files.length}
+              sortOrder={sortOrder}
+            />
+          </aside>
+
+          <section className="flex-1 flex flex-col gap-6 order-1 lg:order-2">
+            {files.length === 0 ? (
+              <div className="border-2 border-dashed border-slate-300 rounded-2xl bg-white p-12 text-center hover:border-primary-400 hover:bg-primary-50/30 transition-all cursor-pointer group relative">
+                <div className="bg-primary-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform">
+                  <UploadCloud className="w-8 h-8 text-primary-600" />
+                </div>
+                <h3 className="text-lg font-semibold text-slate-800 mb-2">
+                  鐐瑰嚮鎴栨嫋鎷芥枃浠跺埌杩欓噷寮€濮嬬鐞?                </h3>
+                <p className="text-slate-500 max-w-md mx-auto">鏀寔 PDF銆丏OCX銆丏OC銆丣PG銆丳NG</p>
+                <div className="flex gap-4 justify-center mt-4 text-xs text-slate-400">
+                  <span className="flex items-center gap-1">
+                    <UploadCloud className="w-3 h-3" />
+                    鎵归噺涓婁紶
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <RefreshCw className="w-3 h-3" />
+                    鐏垫椿鎺掑簭
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Download className="w-3 h-3" />
+                    瀵煎嚭缁撴灉
+                  </span>
+                </div>
+                <input
+                  type="file"
+                  multiple
+                  onChange={handleFileUpload}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                  accept=".pdf,.docx,.doc,.jpg,.jpeg,.png"
+                />
+              </div>
+            ) : (
+              <>
+                <div className="flex justify-between items-center gap-4 flex-wrap">
+                  <div className="relative overflow-hidden group">
+                    <button className="flex h-11 items-center gap-2 bg-white border border-slate-300 hover:border-primary-500 hover:text-primary-600 text-slate-700 px-4 rounded-lg shadow-sm transition-all font-medium text-sm">
+                      <UploadCloud className="w-4 h-4" />
+                      娣诲姞鏇村鏂囦欢 (Add Files)
+                    </button>
+                    <input
+                      type="file"
+                      multiple
+                      onChange={handleFileUpload}
+                      className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                      accept=".pdf,.docx,.doc,.jpg,.jpeg,.png"
+                    />
+                  </div>
+
+                    <div className="flex items-center gap-3 flex-wrap">
+                    <button
+                      onClick={handleCsvExport}
+                      disabled={isProcessing}
+                      className={`flex h-11 items-center gap-2 px-4 rounded-lg border font-medium transition-all text-sm ${
+                        isProcessing
+                          ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
+                          : 'border-slate-300 bg-white text-slate-700 hover:border-primary-400 hover:text-primary-700 hover:bg-primary-50'
+                      }`}
+                    >
+                      <Download className="w-4 h-4" />
+                      瀵煎嚭绉戠爺鎴愭灉娓呭崟 (CSV)
+                    </button>
+
+                    <button
+                      onClick={handleZipExport}
+                      disabled={isProcessing}
+                      className={`flex h-11 items-center gap-2 px-6 rounded-lg shadow-md font-medium text-white transition-all ${
+                        isProcessing
+                          ? 'bg-slate-400 cursor-not-allowed'
+                          : 'bg-primary-600 hover:bg-primary-700 hover:shadow-lg'
+                      }`}
+                    >
+                      {isProcessing ? (
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Download className="w-4 h-4" />
+                      )}
+                      {isProcessing ? '澶勭悊涓?..' : '瀵煎嚭閲嶅懡鍚嶆枃浠?(ZIP)'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex-1 min-h-[500px]">
+                  <FileTable
+                    files={sortedFiles}
+                    rule={rule}
+                    onRemove={removeFile}
+                    onDateChange={updateFileDate}
+                    onReorder={reorderFiles}
+                    sortOrder={sortOrder}
+                    onSortChange={setSortOrder}
+                    onNameSourceChange={updateFileNameSource}
+                  />
+                </div>
+              </>
+            )}
+          </section>
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default App;
+
+=== index.tsx ===
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import App from './App';
+
+const rootElement = document.getElementById('root');
+if (!rootElement) {
+  throw new Error("Could not find root element to mount to");
+}
+
+const root = ReactDOM.createRoot(rootElement);
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+

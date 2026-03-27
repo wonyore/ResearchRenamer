@@ -1,0 +1,5 @@
+{
+  "name": "ResearchRenamer",
+  "description": "A specialized tool for researchers to batch rename and number publication files (PDF/DOCX/Images) based on publication date.",
+  "requestFramePermissions": []
+}
