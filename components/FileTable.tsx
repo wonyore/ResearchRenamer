@@ -408,7 +408,7 @@ export const FileTable: React.FC<FileTableProps> = ({
   };
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col h-full">
+    <div className="min-w-0 bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col h-full">
       <div className="px-6 py-4 border-b border-slate-100 flex flex-col gap-3 bg-slate-50/50 lg:flex-row lg:items-center lg:justify-between">
         <h3 className="font-semibold text-slate-800 flex items-center gap-2">
           <FileText className="w-4 h-4 text-slate-500" />
@@ -431,7 +431,7 @@ export const FileTable: React.FC<FileTableProps> = ({
         </div>
       </div>
 
-      <div className="overflow-auto flex-1 p-0">
+      <div className="min-w-0 overflow-auto flex-1 p-0">
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
           <table className="w-full min-w-[1120px] table-fixed text-left border-collapse">
             <thead className="bg-slate-50 sticky top-0 z-10 text-xs text-slate-500">

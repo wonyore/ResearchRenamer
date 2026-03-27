@@ -17,6 +17,7 @@ import {
   generateNewFilename,
   generateResearchListCsv,
 } from './utils/fileUtils';
+import { DuplicateUploadModal } from './components/DuplicateUploadModal';
 import { FileTable } from './components/FileTable';
 import { Toolbar } from './components/Toolbar';
 import { Download, FileArchive, RefreshCw, UploadCloud } from './components/IconComponents';
@@ -51,10 +52,40 @@ const resolveActiveCleanName = (
 const getDuplicateNameKey = (file: Pick<ResearchFile, 'cleanName' | 'extension'>) =>
   `${file.cleanName.trim().toLocaleLowerCase()}::${file.extension.trim().toLocaleLowerCase()}`;
 
+const getOriginalFilenameKey = (originalName: string) => originalName.trim().toLocaleLowerCase();
+
+const collectOriginalFilenameCounts = (fileList: Array<Pick<ResearchFile, 'originalName'>>) => {
+  const counts = new Map<string, { count: number; displayName: string }>();
+
+  fileList.forEach((file) => {
+    const key = getOriginalFilenameKey(file.originalName);
+    const existingEntry = counts.get(key);
+
+    if (existingEntry) {
+      existingEntry.count += 1;
+      return;
+    }
+
+    counts.set(key, {
+      count: 1,
+      displayName: file.originalName.trim(),
+    });
+  });
+
+  return counts;
+};
+
+interface PendingDuplicateUpload {
+  files: ResearchFile[];
+  duplicatedOriginalNames: string[];
+}
+
 const App: React.FC = () => {
   const [files, setFiles] = useState<ResearchFile[]>([]);
   const [sortOrder, setSortOrder] = useState<SortOrder>('newest');
   const [isProcessing, setIsProcessing] = useState(false);
+  const [pendingDuplicateUpload, setPendingDuplicateUpload] =
+    useState<PendingDuplicateUpload | null>(null);
 
   const [rule, setRule] = useState<RenamingRule>({
     mode: 'sequential',
@@ -128,6 +159,27 @@ const App: React.FC = () => {
     [applyPdfMetadata, markPdfMetadataUnavailable]
   );
 
+  const finalizeFileUpload = useCallback(
+    (newFiles: ResearchFile[]) => {
+      setFiles((prev) => [...prev, ...newFiles]);
+      void hydratePdfMetadata(newFiles);
+    },
+    [hydratePdfMetadata]
+  );
+
+  const closeDuplicateUploadModal = useCallback(() => {
+    setPendingDuplicateUpload(null);
+  }, []);
+
+  const confirmDuplicateUpload = useCallback(() => {
+    if (!pendingDuplicateUpload) {
+      return;
+    }
+
+    finalizeFileUpload(pendingDuplicateUpload.files);
+    setPendingDuplicateUpload(null);
+  }, [finalizeFileUpload, pendingDuplicateUpload]);
+
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const uploadedFiles = event.target.files ? Array.from(event.target.files) : [];
 
@@ -155,11 +207,27 @@ const App: React.FC = () => {
         };
       });
 
-      setFiles((prev) => [...prev, ...newFiles]);
-      void hydratePdfMetadata(newFiles);
-    }
+      const previousOriginalNameCounts = collectOriginalFilenameCounts(files);
+      const nextOriginalNameCounts = collectOriginalFilenameCounts([...files, ...newFiles]);
+      const newlyDuplicatedOriginalNames = Array.from(nextOriginalNameCounts.entries())
+        .filter(
+          ([key, entry]) =>
+            entry.count > 1 && entry.count > (previousOriginalNameCounts.get(key)?.count ?? 0)
+        )
+        .map(([, entry]) => `${entry.displayName} x ${entry.count}`);
 
-    event.target.value = '';
+      event.target.value = '';
+
+      if (newlyDuplicatedOriginalNames.length > 0) {
+        setPendingDuplicateUpload({
+          files: newFiles,
+          duplicatedOriginalNames: newlyDuplicatedOriginalNames,
+        });
+        return;
+      }
+
+      finalizeFileUpload(newFiles);
+    }
   };
 
   const removeFile = (id: string) => {
@@ -315,7 +383,7 @@ const App: React.FC = () => {
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
       <header className="bg-white border-b border-slate-200 shadow-sm sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+        <div className="mx-auto flex h-16 w-full max-w-[1680px] items-center justify-between px-4 sm:px-6 lg:px-8 xl:px-10">
           <div className="flex items-center gap-3">
             <div className="bg-primary-600 p-2 rounded-lg">
               <FileArchive className="w-5 h-5 text-white" />
@@ -346,8 +414,8 @@ const App: React.FC = () => {
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="flex flex-col lg:flex-row gap-8">
+      <main className="mx-auto flex-1 w-full max-w-[1680px] px-4 py-8 sm:px-6 lg:px-8 xl:px-10">
+        <div className="flex min-w-0 flex-col gap-8 lg:flex-row">
           <aside className="w-full lg:w-80 flex-shrink-0 order-2 lg:order-1">
             <Toolbar
               rule={rule}
@@ -357,7 +425,7 @@ const App: React.FC = () => {
             />
           </aside>
 
-          <section className="flex-1 flex flex-col gap-6 order-1 lg:order-2">
+          <section className="order-1 flex min-w-0 flex-1 flex-col gap-6 lg:order-2">
             {files.length === 0 ? (
               <div className="border-2 border-dashed border-slate-300 rounded-2xl bg-white p-12 text-center hover:border-primary-400 hover:bg-primary-50/30 transition-all cursor-pointer group relative">
                 <div className="bg-primary-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform">
@@ -391,7 +459,7 @@ const App: React.FC = () => {
               </div>
             ) : (
               <>
-                <div className="flex justify-between items-center gap-4 flex-wrap">
+                <div className="flex min-w-0 flex-wrap items-center justify-between gap-4">
                   <div className="relative overflow-hidden group">
                     <button className="flex h-11 items-center gap-2 bg-white border border-slate-300 hover:border-primary-500 hover:text-primary-600 text-slate-700 px-4 rounded-lg shadow-sm transition-all font-medium text-sm">
                       <UploadCloud className="w-4 h-4" />
@@ -406,7 +474,7 @@ const App: React.FC = () => {
                     />
                   </div>
 
-                    <div className="flex items-center gap-3 flex-wrap">
+                    <div className="flex min-w-0 flex-wrap items-center gap-3 lg:justify-end">
                     <button
                       onClick={handleCsvExport}
                       disabled={isProcessing}
@@ -439,7 +507,7 @@ const App: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="flex-1 min-h-[500px]">
+                <div className="min-w-0 flex-1 min-h-[500px]">
                   <FileTable
                     files={sortedFiles}
                     rule={rule}
@@ -456,6 +524,14 @@ const App: React.FC = () => {
           </section>
         </div>
       </main>
+
+      {pendingDuplicateUpload && (
+        <DuplicateUploadModal
+          duplicatedNames={pendingDuplicateUpload.duplicatedOriginalNames}
+          onConfirm={confirmDuplicateUpload}
+          onCancel={closeDuplicateUploadModal}
+        />
+      )}
     </div>
   );
 };

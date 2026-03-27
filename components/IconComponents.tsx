@@ -1,4 +1,5 @@
 import { 
+  AlertTriangle,
   UploadCloud, 
   FileText, 
   X, 
@@ -14,6 +15,7 @@ import {
 } from 'lucide-react';
 
 export {
+  AlertTriangle,
   UploadCloud,
   FileText,
   X,

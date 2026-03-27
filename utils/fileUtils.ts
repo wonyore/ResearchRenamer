@@ -117,11 +117,45 @@ const loadPdfJs = async (): Promise<PdfJsContext> => {
 const normalizeWhitespace = (value: string): string =>
   value.replace(/\0/g, '').replace(/\s+/g, ' ').trim();
 
-const stripLeadingNumbering = (value: string): string =>
-  value
-    .replace(/^(\[|\()?(\d{1,5})(\]|\))?[\s._-]*/, '')
-    .replace(/^(P|V|No\.?)?[-_]?\d{1,5}[-_.\s]+/i, '')
-    .trim();
+type LeadingNumberingInfo = {
+  originalNumber: number | null;
+  cleanValue: string;
+};
+
+const extractLeadingNumbering = (value: string): LeadingNumberingInfo => {
+  const trimmedValue = value.trim();
+  const patterns: RegExp[] = [
+    /^\[(\d{1,5})\]/,
+    /^\((\d{1,5})\)/,
+    /^(?:P|V|No\.?)\s*[-_]?\s*(\d{1,5})(?=$|[\s._-])/i,
+    /^(\d{1,5})(?=$|[\s._-])/,
+    /^(\d{1,5})(?=[A-Za-z0-9]{1,6}~\d+$)/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = trimmedValue.match(pattern);
+    if (!match?.[1]) {
+      continue;
+    }
+
+    const cleanValue = trimmedValue
+      .slice(match[0].length)
+      .replace(/^[\s._-]+/, '')
+      .trim();
+
+    return {
+      originalNumber: parseInt(match[1], 10),
+      cleanValue: cleanValue || trimmedValue,
+    };
+  }
+
+  return {
+    originalNumber: null,
+    cleanValue: trimmedValue,
+  };
+};
+
+const stripLeadingNumbering = (value: string): string => extractLeadingNumbering(value).cleanValue;
 
 const sanitizeTitle = (title: string | null): string | null => {
   if (!title) {
@@ -748,8 +782,10 @@ export const hasDateInFilename = (filename: string): boolean =>
   ISO_DATE_PATTERN.test(filename) || YEAR_PATTERN.test(filename);
 
 export const extractNumberFromFilename = (filename: string): number | null => {
-  const match = filename.match(/^(\[|\(|P|No\.?)?\s*(\d{1,5})(\]|\)|\.|_|-|\s)/i);
-  return match?.[2] ? parseInt(match[2], 10) : null;
+  const lastDotIndex = filename.lastIndexOf('.');
+  const nameWithoutExt = lastDotIndex !== -1 ? filename.slice(0, lastDotIndex) : filename;
+
+  return extractLeadingNumbering(nameWithoutExt).originalNumber;
 };
 
 export const cleanFilename = (filename: string): { clean: string; ext: string } => {
