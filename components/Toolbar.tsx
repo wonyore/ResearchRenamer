@@ -170,7 +170,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({ rule, setRule, fileCount, sort
       </div>
 
       <div className="bg-slate-50 rounded-lg p-4 border border-slate-100">
-        <h3 className="text-xs font-semibold text-slate-500 mb-2">预览状态</h3>
+        <h3 className="mb-2 text-sm font-semibold tracking-tight text-slate-600">预览状态</h3>
         <div className="flex justify-between items-center text-sm">
           <span className="text-slate-600">排序模式：</span>
           <span className="font-bold text-primary-700">{getSortOrderLabel(sortOrder)}</span>
