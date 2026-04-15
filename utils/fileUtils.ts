@@ -7,7 +7,7 @@ import {
   ResearchFile,
 } from '../types';
 
-type PdfJsModule = typeof import('pdfjs-dist');
+type PdfJsModule = typeof import('pdfjs-dist/legacy/build/pdf.mjs');
 
 type PdfJsContext = {
   pdfjs: PdfJsModule;
@@ -100,8 +100,8 @@ const PREFERRED_METADATA_KEYS = ['x-default', 'default', 'en-US', 'en', 'und'];
 const loadPdfJs = async (): Promise<PdfJsContext> => {
   if (!pdfJsPromise) {
     pdfJsPromise = Promise.all([
-      import('pdfjs-dist'),
-      import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+      import('pdfjs-dist/legacy/build/pdf.mjs'),
+      import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'),
     ]).then(([pdfjs, workerModule]) => {
       pdfjs.GlobalWorkerOptions.workerSrc = workerModule.default;
       return {
@@ -813,26 +813,23 @@ const shouldRetryWithoutWorker = (error: unknown): boolean => {
 
 const parsePdfMetadata = async (
   file: File,
-  useExplicitWorker = true
+  useWorkerPort = false
 ): Promise<PDFMetadataResult | null> => {
   const { pdfjs, workerUrl } = await loadPdfJs();
   const buffer = await file.arrayBuffer();
   const data = new Uint8Array(buffer);
-  let pdfWorker: { destroy: () => void } | null = null;
+  let workerPort: Worker | null = null;
+  pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
   const loadingTask = (() => {
-    if (!useExplicitWorker) {
+    if (!useWorkerPort) {
+      pdfjs.GlobalWorkerOptions.workerPort = null;
       return pdfjs.getDocument({ data });
     }
 
-    pdfWorker = pdfjs.PDFWorker.create({
-      port: new Worker(workerUrl, { type: 'module' }),
-    }) as unknown as { destroy: () => void };
-
-    return pdfjs.getDocument({
-      data,
-      worker: pdfWorker as never,
-    });
+    workerPort = new Worker(workerUrl, { type: 'module' });
+    pdfjs.GlobalWorkerOptions.workerPort = workerPort;
+    return pdfjs.getDocument({ data });
   })();
 
   try {
@@ -874,8 +871,9 @@ const parsePdfMetadata = async (
       cleanNameSource: resolvedCleanName.source,
     };
   } finally {
+    pdfjs.GlobalWorkerOptions.workerPort = null;
     await loadingTask.destroy().catch(() => undefined);
-    pdfWorker?.destroy();
+    workerPort?.terminate();
   }
 };
 
@@ -890,7 +888,7 @@ export const extractMetadataFromPDF = async (file: File): Promise<PDFMetadataRes
   } catch (error) {
     if (shouldRetryWithoutWorker(error)) {
       try {
-        return await parsePdfMetadata(file, false);
+        return await parsePdfMetadata(file, true);
       } catch (fallbackError) {
         console.warn(`Failed to parse PDF data for "${file.name}".`, fallbackError);
         return null;
