@@ -1,0 +1,23 @@
+{
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/ResearchRenamer/",
+      "permanent": false
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/ResearchRenamer",
+      "destination": "/"
+    },
+    {
+      "source": "/ResearchRenamer/",
+      "destination": "/"
+    },
+    {
+      "source": "/ResearchRenamer/:path*",
+      "destination": "/:path*"
+    }
+  ]
+}
