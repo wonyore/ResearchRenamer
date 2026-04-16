@@ -1,0 +1,4 @@
+[[platforms]]
+api_base = "https://hub.zjulab.cn"
+project_id = "69c9d09e8c1975c4cc6ce6b4"
+artifact_dir = "dist"
